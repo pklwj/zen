@@ -1,0 +1,11 @@
+/* 自定义样式 */
+.md-header {
+    background-color: #39C5BB;
+}
+
+/* 响应式设计 */
+@media (max-width: 768px) {
+    .md-header {
+        padding: 0.5rem;
+    }
+}
