@@ -2,7 +2,7 @@ import fitz  # PyMuPDF
 import zipfile
 import time
 import os
-import shutil
+import io  # 👈 核心：引入 Python 内存流组件
 import platform
 import subprocess
 from pathlib import Path
@@ -20,61 +20,58 @@ def get_available_memory_mb():
     try:
         system = platform.system()
         if system == "Windows":
-            # Windows: 使用 wmic 获取可用内存 (字节)
             output = subprocess.check_output("wmic OS get FreePhysicalMemory", shell=True).decode()
             return int(output.strip().split('\n')[-1].strip()) // 1024
         elif system == "Linux":
-            # Linux: 读取 /proc/meminfo
             with open('/proc/meminfo', 'r') as f:
                 for line in f:
                     if 'MemAvailable' in line:
                         return int(line.split()[1]) // 1024
         elif system == "Darwin":
-            # macOS: 使用 vm_stat (粗略估算)
-            output = subprocess.check_output("vm_stat", shell=True).decode()
-            for line in output.split('\n'):
-                if "Pages free" in line or "Pages inactive" in line:
-                    pass # macOS 内存管理较复杂，这里给个保守默认值
-            return 2048 
+            return 4096  # macOS 默认分配一个较为宽松的保守值
     except Exception:
         pass
-    return 2048  # 如果识别失败，保守假设有 2GB 可用内存
+    return 2048
 
 def get_optimal_workers(total_files):
     """
     🧠 智能识别系统环境，自动计算最优进程数
     """
-    # 1. 自动识别 CPU 核心数
     logical_cores = os.cpu_count() or 4
-    # 限制最大 CPU 占用，防止电脑卡死（最多使用 80% 的核心，且上限为 12）
     max_cpu_workers = max(1, min(int(logical_cores * 0.8), 12))
     
-    # 2. 自动识别可用内存 (防止内存撑爆)
+    # 💡 优化：由于引入了纯内存提取，单个进程需要同时在内存中容纳原 PDF 和新 CBZ
+    # 保守估计每个进程需要 800MB 内存，防止高并发时内存溢出
     available_mb = get_available_memory_mb()
-    # 提取 PDF 和打包 ZIP 比较吃内存，保守估计每个进程需要 500MB 内存
-    max_memory_workers = max(1, int(available_mb / 500))
+    max_memory_workers = max(1, int(available_mb / 800))
     
-    # 3. 自动识别文件数量 (只有3个文件就只开3个进程)
     file_workers = total_files
-    
-    # 4. 取三者的最小值，得出最完美的并发数
     optimal = min(file_workers, max_cpu_workers, max_memory_workers)
     
     return optimal, logical_cores, available_mb
 
 def process_comic_pdf(pdf_path, output_dir, area_threshold):
-    """处理单个漫画 PDF：直接提取内嵌的原始图片"""
+    """处理单个漫画 PDF：全内存提取与打包，最后一次性落盘"""
     cbz_path = output_dir / f"{pdf_path.stem}.cbz"
     
     if cbz_path.exists():
         return f"⏭️ 跳过 (已存在): {pdf_path.name}"
 
     try:
-        doc = fitz.open(pdf_path)
+        # 1. ⚡ 磁盘 I/O (读)：一次性将整个 PDF 读入内存
+        with open(pdf_path, 'rb') as f:
+            pdf_bytes = f.read()
+            
+        # 将内存字节流喂给 PyMuPDF
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         total_pages = len(doc)
         extracted_count = 0
         
-        with zipfile.ZipFile(cbz_path, 'w', zipfile.ZIP_STORED) as cbz:
+        # 2. 🧠 纯内存操作：开辟内存缓冲区充当虚拟 ZIP 硬盘
+        memory_zip_stream = io.BytesIO()
+        
+        # 在内存流中直接构建 ZIP/CBZ 包
+        with zipfile.ZipFile(memory_zip_stream, 'w', zipfile.ZIP_STORED) as cbz:
             for page_num in range(total_pages):
                 page = doc[page_num]
                 page_area = page.rect.width * page.rect.height
@@ -96,6 +93,7 @@ def process_comic_pdf(pdf_path, output_dir, area_threshold):
                     except Exception:
                         continue
                 
+                # 提取符合阈值的大图
                 if best_img_info and (max_img_area / page_area) >= area_threshold:
                     xref = best_img_info[0]
                     try:
@@ -107,6 +105,7 @@ def process_comic_pdf(pdf_path, output_dir, area_threshold):
                                 image_ext = "jpg"
                             
                             arcname = f"{page_num + 1:04d}.{image_ext}"
+                            # 写入内存中的加密/打包区，没有任何磁盘读写延迟
                             cbz.writestr(arcname, image_bytes)
                             extracted_count += 1
                     except Exception:
@@ -114,10 +113,16 @@ def process_comic_pdf(pdf_path, output_dir, area_threshold):
         
         doc.close()
         
+        # 3. ⚡ 磁盘 I/O (写)：一卷漫画全部打包完成后，一次性将内存里的 CBZ 倾倒进磁盘
+        if extracted_count > 0:
+            final_cbz_bytes = memory_zip_stream.getvalue()
+            with open(cbz_path, 'wb') as f:
+                f.write(final_cbz_bytes)
+        
         if extracted_count < total_pages * 0.5 and total_pages > 2:
             return f"⚠️ 提取较少: {pdf_path.name} ({extracted_count}/{total_pages}页) 可能是碎图PDF"
             
-        return f"✅ 成功: {pdf_path.name} -> {cbz_path.name} (原始画质，{extracted_count}页)"
+        return f"✅ 成功 (纯内存重构): {pdf_path.name} -> {cbz_path.name} ({extracted_count}页)"
         
     except Exception as e:
         if cbz_path.exists():
@@ -131,12 +136,11 @@ def batch_convert_comics(input_dir, output_dir):
         print("💡 未找到 PDF 文件")
         return
     
-    # 🧠 自动识别环境并计算最优进程数
     workers, cpu_cores, mem_mb = get_optimal_workers(len(pdfs))
     
     print(f"\n🔍 环境识别: CPU {cpu_cores}核 | 可用内存 {mem_mb}MB | 待处理 {len(pdfs)} 个文件")
-    print(f"⚙️ 智能分配: 自动开启 {workers} 个并发进程 (防卡顿·防内存溢出)")
-    print(f"⚙️ 过滤阈值: {AREA_THRESHOLD * 100:.0f}% (自动丢弃小图标)")
+    print(f"⚙️ 智能分配: 自动开启 {workers} 个并发进程 (内存自适应防卡顿)")
+    print(f"⚙️ 过滤阈值: {AREA_THRESHOLD * 100:.0f}%")
     start_time = time.time()
     
     process_func = partial(process_comic_pdf, output_dir=output_dir, area_threshold=AREA_THRESHOLD)
@@ -150,9 +154,9 @@ def batch_convert_comics(input_dir, output_dir):
     print(f"\n🎉 全部完成！共处理 {len(pdfs)} 本漫画 | 总耗时: {elapsed:.2f}秒")
 
 if __name__ == "__main__":
-    print("="*55)
-    print(" 📚 漫画 PDF 转 CBZ 极速工具 (智能自适应·原始画质版)")
-    print("="*55)
+    print("=========================================================")
+    print(" 📚 漫画 PDF 转 CBZ 极速工具 (纯内存流加速版)")
+    print("=========================================================")
     
     input_str = input("📂 请输入漫画 PDF 所在目录 (回车默认为当前目录): ").strip()
     input_dir = Path(input_str or ".").resolve()
