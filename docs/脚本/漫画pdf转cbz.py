@@ -1,5 +1,3 @@
-# 漫画pdf转cbz
-```python
 import fitz  # PyMuPDF
 import zipfile
 import time
@@ -169,4 +167,3 @@ if __name__ == "__main__":
     batch_convert_comics(input_dir, output_dir)
     
     print(f"\n📂 CBZ 文件已输出至: {output_dir.resolve()}")
-```
