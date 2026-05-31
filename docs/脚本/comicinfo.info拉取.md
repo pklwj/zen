@@ -14,16 +14,15 @@
 
 ```python
 import os
-import sys
-import xml.etree.ElementTree as ET
-from xml.dom import minidom
-import zipfile
 import re
-import requests
 import time
-import shutil
-import threading
+import zipfile
+import functools
+import xml.etree.ElementTree as ET
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -31,95 +30,64 @@ from urllib3.util.retry import Retry
 # 性能与全局配置区
 # ==============================================================================
 MAX_WORKERS = 4
-# 优先从系统环境变量获取 Token，若没有则使用默认（建议生产环境不硬编码）
+# 优先从系统环境变量获取 Token，若没有则使用默认
 BGM_TOKEN = os.getenv("BANGUMI_TOKEN", "eQBFKrLUr8g0RqLrukNmfVC6QLSR0gCzQxlqtUxw")
-IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif')
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'}
+API_REQUEST_DELAY = 0.8  # 请求间隔，防IP/Token封禁
 
-# Bangumi API 全局配置 & 缓存
-API_REQUEST_DELAY = 0.8       # 请求间隔，防IP/Token封禁
-SEARCH_CACHE = dict()          # 搜索结果缓存
-SUBJECT_CACHE = dict()         # 条目详情缓存
-cache_lock = threading.Lock()  # 线程锁，确保多线程下缓存读写安全
-
-# 全局请求会话 + 重试策略
+# 全局请求会话 + 重试策略 (自动处理网络波动，无需手写 while 循环)
 session = requests.Session()
-retry_strategy = Retry(
-    total=3,
-    backoff_factor=0.5,
-    status_forcelist=[429, 500, 502, 503, 504]
-)
+retry_strategy = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
 adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
 
+# 💡 优化 1：预编译正则表达式 (提升批量处理性能，避免重复编译)
+CLEAN_NAME_PATTERN = re.compile(
+    r'(?i)\[.*?\]|\(.*?\)|'
+    r'\b(?:vol\.?|v|ch\.?|chapter|tome)\s*\d+\b|'
+    r'第\s*\d+\s*[卷话册本]|'
+    r'\b\d+\b'
+)
+VOLUME_PATTERN = re.compile(r'(?:[Vv]ol\.?|[Vv]|第)\s*(\d+)|(\d+)')
+
 # ==============================================================================
 # Bangumi 网络数据请求模块
 # ==============================================================================
+# 💡 优化 2：利用 lru_cache 自动实现线程安全的内存缓存，干掉手动字典和 threading.Lock
+@functools.lru_cache(maxsize=None)
 def search_bangumi_subject(keywords, token=None):
-    with cache_lock:
-        if keywords in SEARCH_CACHE:
-            print(f"💾 搜索结果命中缓存: {keywords}")
-            return SEARCH_CACHE[keywords]
-
     url = "https://api.bgm.tv/v0/search/subjects"
-    headers = {
-        "User-Agent": "ComicScraper/1.0 (Windows)",
-        "Accept": "application/json"
-    }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    headers = {"User-Agent": "ComicScraper/1.0 (Windows)", "Accept": "application/json"}
+    if token: headers["Authorization"] = f"Bearer {token}"
 
-    # 修正：Bangumi API 中 type=1 代表书籍(Book)，包含漫画与小说
-    payload = {
-        "keyword": keywords,
-        "filter": {"type": [1]},  
-        "limit": 5
-    }
+    payload = {"keyword": keywords, "filter": {"type": [1]}, "limit": 5}
 
     try:
-        time.sleep(API_REQUEST_DELAY)  # 限流保护
+        time.sleep(API_REQUEST_DELAY)  # 限流保护 (命中缓存时不会执行此行)
         response = session.post(url, json=payload, headers=headers, timeout=15)
         response.raise_for_status()
         res_data = response.json().get("data", [])
-        
-        with cache_lock:
-            SEARCH_CACHE[keywords] = res_data
-        return res_data
+        print(f"🌐 搜索成功: {keywords} (找到 {len(res_data)} 条)")
+        return tuple(res_data)  # lru_cache 要求返回值可哈希，转为 tuple
     except requests.exceptions.RequestException as e:
         print(f"❌ 搜索请求失败: {str(e)[:60]}")
-        with cache_lock:
-            SEARCH_CACHE[keywords] = []  
-        return []
+        return tuple()
 
+@functools.lru_cache(maxsize=None)
 def get_bangumi_comic_info(subject_id, token=None):
-    sid = str(subject_id)
-    with cache_lock:
-        if sid in SUBJECT_CACHE:
-            print(f"💾 条目详情命中缓存: ID {subject_id}")
-            return SUBJECT_CACHE[sid]
-
     url = f"https://api.bgm.tv/v0/subjects/{subject_id}"
-    headers = {
-        "User-Agent": "ComicScraper/1.0 (Windows)",
-        "Accept": "application/json"
-    }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    headers = {"User-Agent": "ComicScraper/1.0 (Windows)", "Accept": "application/json"}
+    if token: headers["Authorization"] = f"Bearer {token}"
 
     try:
-        time.sleep(API_REQUEST_DELAY)  # 限流保护
+        time.sleep(API_REQUEST_DELAY)
         response = session.get(url, headers=headers, timeout=15)
         response.raise_for_status()
-        res_data = response.json() if response.json() else {}
-        
-        with cache_lock:
-            SUBJECT_CACHE[sid] = res_data
-        return res_data
+        return response.json() or {}
     except Exception as e:
         print(f"❌ 获取条目详情失败(ID:{subject_id}): {str(e)[:60]}")
-        with cache_lock:
-            SUBJECT_CACHE[sid] = {}  
-        return []
+        return {}
 
 # ==============================================================================
 # XML 生成与文件名清洗模块
@@ -130,108 +98,80 @@ def generate_comic_info_xml(data, volume_number, page_count=0, item_title=""):
         "xmlns:xsd": "http://www.w3.org/2001/XMLSchema"
     })
 
-    name_cn = data.get("name_cn") or data.get("name")
-    ET.SubElement(root, "Series").text = name_cn
-    ET.SubElement(root, "Number").text = str(volume_number)
-    ET.SubElement(root, "Volume").text = str(volume_number)
-    ET.SubElement(root, "Title").text = item_title if item_title else f"第 {volume_number} 卷"
+    # 💡 优化 3：使用辅助函数消灭满屏的 if 判断
+    def add_node(tag, text):
+        if text not in (None, ""):
+            ET.SubElement(root, tag).text = str(text)
 
-    if page_count > 0:
-        ET.SubElement(root, "PageCount").text = str(page_count)
+    add_node("Series", data.get("name_cn") or data.get("name"))
+    add_node("Number", volume_number)
+    add_node("Volume", volume_number)
+    add_node("Title", item_title or f"第 {volume_number} 卷")
+    if page_count > 0: add_node("PageCount", page_count)
+    add_node("Summary", data.get("summary"))
 
-    summary = data.get("summary", "")
-    if summary:
-        ET.SubElement(root, "Summary").text = summary
-
-    date_str = data.get("date", "")
-    if date_str:
+    # 日期处理
+    if date_str := data.get("date"):
         parts = date_str.split("-")
-        if len(parts) >= 1 and parts[0]:
-            ET.SubElement(root, "Year").text = parts[0]
-        if len(parts) >= 2 and parts[1]:
-            ET.SubElement(root, "Month").text = str(int(parts[1]))
-        if len(parts) >= 3 and parts[2]:
-            ET.SubElement(root, "Day").text = str(int(parts[2]))
+        if len(parts) >= 1: add_node("Year", parts[0])
+        if len(parts) >= 2 and parts[1]: add_node("Month", int(parts[1]))
+        if len(parts) >= 3 and parts[2]: add_node("Day", int(parts[2]))
 
-    infobox = data.get("infobox", [])
+    # 解析 Infobox (使用 set 提升 in 判断效率)
     writers, pencillers, publishers = [], [], []
     total_volumes = "0"
-
-    for item in infobox:
-        key = item.get("key", "")
-        value_data = item.get("value", "")
-
-        values = [v.get("v", "") for v in value_data if "v" in v] if isinstance(value_data, list) else [value_data]
+    for item in data.get("infobox", []):
+        key, val_data = item.get("key", ""), item.get("value", "")
+        values = [v.get("v", "") for v in val_data if "v" in v] if isinstance(val_data, list) else [val_data]
         values = [v for v in values if v]
-        if not values:
-            continue
+        if not values: continue
 
-        if key in ["作者", "原作", "原案"]:
-            writers.extend(values)
-        elif key in ["作画", "插画", "插图", "漫画"]:
-            pencillers.extend(values)
-        elif key in ["出版社"]:
-            publishers.extend(values)
-        elif key in ["册数", "卷数"]:
-            total_volumes = values[0].replace("卷", "").replace("册", "").strip()
+        if key in {"作者", "原作", "原案"}: writers.extend(values)
+        elif key in {"作画", "插画", "插图", "漫画"}: pencillers.extend(values)
+        elif key == "出版社": publishers.extend(values)
+        elif key in {"册数", "卷数"}: total_volumes = values[0].replace("卷", "").replace("册", "").strip()
 
-    if writers:
-        ET.SubElement(root, "Writer").text = ", ".join(writers)
-    if pencillers:
-        ET.SubElement(root, "Penciller").text = ", ".join(pencillers)
-    elif writers:
-        ET.SubElement(root, "Penciller").text = ", ".join(writers)
+    add_node("Writer", ", ".join(writers) if writers else None)
+    add_node("Penciller", ", ".join(pencillers) if pencillers else ", ".join(writers))
+    add_node("Publisher", ", ".join(publishers) if publishers else None)
+    if total_volumes.isdigit() and int(total_volumes) > 0: add_node("Count", total_volumes)
 
-    if publishers:
-        ET.SubElement(root, "Publisher").text = ", ".join(publishers)
-
-    if total_volumes.isdigit() and int(total_volumes) > 0:
-        ET.SubElement(root, "Count").text = total_volumes
-
-    rating = data.get("rating", {}).get("score")
-    if rating:
-        ET.SubElement(root, "CommunityRating").text = str(rating)
-
+    if rating := data.get("rating", {}).get("score"): add_node("CommunityRating", rating)
     tags = [t.get("name") for t in data.get("tags", []) if t.get("name")]
-    if tags:
-        ET.SubElement(root, "Tags").text = ", ".join(tags[:10])
+    if tags: add_node("Tags", ", ".join(tags[:10]))
 
-    ET.SubElement(root, "Manga").text = "Yes"
-    ET.SubElement(root, "Web").text = f"https://bgm.tv/subject/{data.get('id')}"
+    add_node("Manga", "Yes")
+    add_node("Web", f"https://bgm.tv/subject/{data.get('id')}")
 
-    xml_str = ET.tostring(root, encoding="utf-8")
-    parsed_str = minidom.parseString(xml_str)
-    return parsed_str.toprettyxml(indent="  ", encoding="utf-8").decode("utf-8")
+    # 💡 优化 4：抛弃 minidom，使用原生 ET.indent (避免产生多余空行 Bug)
+    ET.indent(root, space="  ")
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True).decode("utf-8")
 
 def clean_comic_name(filename):
-    name = os.path.splitext(filename)[0]
-    name = re.sub(r'\[.*?\]|\(.*?\)', '', name)
-    name = re.sub(r'(?i)\b(vol\.?|v|ch\.?|chapter|tome)\s*\d+\b', '', name)
-    name = re.sub(r'第\s*\d+\s*[卷话册本]', '', name)
-    name = re.sub(r'\b\d+\b', '', name)
-    name = name.strip(" -_[]().")
-    return name
+    name = Path(filename).stem
+    return CLEAN_NAME_PATTERN.sub('', name).strip(" -_[]().")
 
 def extract_volume_number(filename):
-    match = re.search(r'(?:[Vv]ol\.?|[Vv]|[第第])\s*(\d+)', filename)
-    if match:
-        return int(match.group(1))
-    match = re.search(r'(\d+)', filename)
-    if match:
-        return int(match.group(1))
+    match = VOLUME_PATTERN.search(filename)
+    if match: return int(match.group(1) or match.group(2))
     return 1
 
 # ==============================================================================
-# 核心工作流
+# 核心工作流 (ZIP 注入)
 # ==============================================================================
 def inject_xml_into_zip_worker(file_info):
     file_path, bgm_data, filename = file_info
     vol_num = extract_volume_number(filename)
-    page_count = 0
-    has_comic_info = False
-
+    
     try:
-        with zipfile.ZipFile(file_path, 'r') as zin:
+        temp_zip = file_path + ".temp"
+        page_count = 0
+        has_comic_info = False
+
+        # 💡 优化 5：统一使用“读写分离”的流式搬运，干掉臃肿的 if-else 分支
+        with zipfile.ZipFile(file_path, 'r') as zin, \
+             zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as zout:
+            
             for item in zin.infolist():
                 try:
                     actual_filename = item.filename.encode('cp437').decode('utf-8')
@@ -240,41 +180,30 @@ def inject_xml_into_zip_worker(file_info):
 
                 if actual_filename.lower() == 'comicinfo.xml':
                     has_comic_info = True
-                if actual_filename.lower().endswith(IMAGE_EXTENSIONS):
+                    continue  # 过滤掉旧的 XML
+                
+                if Path(actual_filename).suffix.lower() in IMAGE_EXTENSIONS:
                     page_count += 1
+                    
+                zout.writestr(item, zin.read(item.filename))
 
-        xml_content = generate_comic_info_xml(bgm_data, volume_number=vol_num, page_count=page_count)
+            # 注入包含真实页数的新 XML
+            xml_content = generate_comic_info_xml(bgm_data, vol_num, page_count)
+            zout.writestr('ComicInfo.xml', xml_content)
 
-        if has_comic_info:
-            temp_zip = file_path + ".temp"
-            with zipfile.ZipFile(file_path, 'r') as zin:
-                with zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as zout:
-                    for item in zin.infolist():
-                        try:
-                            af = item.filename.encode('cp437').decode('utf-8')
-                        except Exception:
-                            af = item.filename
-                        if af.lower() == 'comicinfo.xml':
-                            continue
-                        try:
-                            zout.writestr(item, zin.read(item.filename))
-                        except Exception:
-                            continue
-                    zout.writestr('ComicInfo.xml', xml_content, compress_type=zipfile.ZIP_DEFLATED)
-            shutil.move(temp_zip, file_path)
-            return f"⚡ [更新] 成功替换旧 XML (第 {vol_num} 卷/共 {page_count} 页) -> {filename}"
-        else:
-            with zipfile.ZipFile(file_path, 'a', compression=zipfile.ZIP_DEFLATED) as zout:
-                zout.writestr('ComicInfo.xml', xml_content)
-            return f"⚡ [秒过] 成功追加 XML (第 {vol_num} 卷/共 {page_count} 页) -> {filename}"
+        # 原子替换
+        os.replace(temp_zip, file_path)
+        action = "更新" if has_comic_info else "秒过"
+        return f"⚡ [{action}] 成功注入 XML (第 {vol_num} 卷/共 {page_count} 页) -> {filename}"
 
-    except Exception:
+    except Exception as e:
+        # 兜底：如果压缩包损坏，尝试强制追加
         try:
             with zipfile.ZipFile(file_path, 'a', compression=zipfile.ZIP_DEFLATED) as zout:
                 zout.writestr('ComicInfo.xml', generate_comic_info_xml(bgm_data, vol_num, 0))
             return f"⚠️ [强制写入] 压缩包损坏，已成功注入XML -> {filename}"
-        except Exception as e:
-            return f"❌ 无法处理 -> {filename} (原因: {e})"
+        except Exception as final_e:
+            return f"❌ 无法处理 -> {filename} (原因: {final_e})"
 
 # ==============================================================================
 # 核心业务逻辑封装
@@ -284,42 +213,38 @@ def process_single_directory(target_dir):
     print(f"📂 正在处理目录: {target_dir}")
     print(f"📂 -----------------------------------------------------")
 
-    files = [f for f in os.listdir(target_dir) if f.lower().endswith(('.zip', '.cbz'))]
+    # 💡 优化 6：使用 pathlib 优雅地获取文件列表
+    folder = Path(target_dir)
+    files = [f for f in folder.iterdir() if f.suffix.lower() in {'.zip', '.cbz'}]
+    
     if not files:
         print("💡 未在此文件夹内找到 .zip 或 .cbz 格式的漫画文件，跳过。")
         return False
 
-    guessed_names = set()
-    for f in files:
-        cleaned = clean_comic_name(f)
-        if cleaned:
-            guessed_names.add(cleaned)
-
+    # 智能识别名字
+    guessed_names = {clean_comic_name(f.name) for f in files if clean_comic_name(f.name)}
     if not guessed_names:
         search_keyword = input("🤔 未能自动解析出漫画名字，请手动输入名称搜索: ").strip()
     else:
         default_search = list(guessed_names)[0]
         print(f"🤖 智能识别出的漫画名字为: 【{default_search}】")
         search_keyword = input(f"直接[回车]以此名字搜索，或输入新名字(输入s跳过本文件夹): ").strip()
-        if search_keyword.lower() == 's':
-            return False
-        if not search_keyword:
-            search_keyword = default_search
+        if search_keyword.lower() == 's': return False
+        if not search_keyword: search_keyword = default_search
 
     if not search_keyword:
         print("⏩ 关键字为空，跳过此文件夹。")
         return False
 
     print(f"🌐 正在 Bangumi 搜索 '{search_keyword}'...")
-    search_results = search_bangumi_subject(search_keyword, token=BGM_TOKEN)
+    # 注意：lru_cache 返回的是 tuple，需要转回 list 方便后续操作
+    search_results = list(search_bangumi_subject(search_keyword, token=BGM_TOKEN))
 
     if not search_results:
         print("❌ 未能在 Bangumi 上搜到相关书籍/漫画。")
         manual_id = input("💡 请手动输入 bgm.tv 条目 ID (直接回车跳过当前文件夹): ").strip()
-        if manual_id.isdigit():
-            selected_subject_id = int(manual_id)
-        else:
-            return False
+        if not manual_id.isdigit(): return False
+        selected_subject_id = int(manual_id)
     else:
         print("\n🔍 找到以下最匹配的 Bangumi 结果:")
         for idx, item in enumerate(search_results):
@@ -342,17 +267,15 @@ def process_single_directory(target_dir):
     final_title = bgm_data.get('name_cn') or bgm_data.get('name')
     print(f"🚀 元数据已就绪！并发数: {MAX_WORKERS}，正在处理: 《{final_title}》...")
 
-    tasks = [(os.path.join(target_dir, f), bgm_data, f) for f in files]
+    tasks = [(str(f), bgm_data, f.name) for f in files]
     start_time = time.time()
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(inject_xml_into_zip_worker, task): task for task in tasks}
+        futures = [executor.submit(inject_xml_into_zip_worker, task) for task in tasks]
         for future in as_completed(futures):
             print(future.result())
 
-    elapsed = time.time() - start_time
-    print(f"🎉 当前文件夹 【{final_title}】 处理完成！累计耗时: {elapsed:.2f} 秒。")
-
+    print(f"🎉 当前文件夹 【{final_title}】 处理完成！累计耗时: {time.time() - start_time:.2f} 秒。")
     return True
 
 # ==============================================================================
@@ -360,12 +283,10 @@ def process_single_directory(target_dir):
 # ==============================================================================
 def main():
     print("=========================================================")
-    print(" 🎬 Bangumi 漫画刮削器 (纯命令行·线程安全优化版) ")
+    print(" 🎬 Bangumi 漫画刮削器 (纯命令行·极简重构版) ")
     print("=========================================================")
-
     print("请粘贴漫画文件夹路径（每行一个，可带双引号，支持右键直接粘贴）")
-    print("输入完成后，按【回车】输入空行结束输入！")
-    print("---------------------------------------------------------")
+    print("输入完成后，按【回车】输入空行结束输入！\n" + "-"*50)
 
     chosen_directories = []
     while True:
@@ -373,11 +294,10 @@ def main():
             line = input().strip()
         except EOFError:
             break
-        if not line:
-            break
-        # 去除两侧引号并标准化路径
-        path = line.strip('"\'').strip()
-        if os.path.isdir(path):
+        if not line: break
+        
+        path = Path(line.strip('"\'').strip())
+        if path.is_dir():
             chosen_directories.append(path)
         else:
             print(f"⚠️  无效路径已跳过: {line}")
@@ -386,28 +306,23 @@ def main():
         print("\n👋 未输入有效路径，程序退出")
         return
 
-    print("\n" + "="*50)
-    print(f"📋 成功识别到 {len(chosen_directories)} 个有效文件夹：")
+    print(f"\n📋 成功识别到 {len(chosen_directories)} 个有效文件夹：")
     for index, folder_path in enumerate(chosen_directories, 1):
         print(f"{index}. {folder_path}")
-    print("="*50)
-
     input("\n按回车键开始批量处理所有文件夹...")
 
     total_dirs = len(chosen_directories)
-    print(f"\n✅ 共选中 {total_dirs} 个文件夹，开始处理...")
-
     global_start_time = time.time()
+    
     for i, directory in enumerate(chosen_directories, 1):
         print(f"\n====================== 进度: {i}/{total_dirs} ======================")
-        process_single_directory(directory)
+        process_single_directory(str(directory))
 
-    total_elapsed = time.time() - global_start_time
-    print(f"\n🏁 全部处理完成！总耗时: {total_elapsed:.2f} 秒")
+    print(f"\n🏁 全部处理完成！总耗时: {time.time() - global_start_time:.2f} 秒")
     
-    with cache_lock:
-        SEARCH_CACHE.clear()
-        SUBJECT_CACHE.clear()
+    # 清理缓存
+    search_bangumi_subject.cache_clear()
+    get_bangumi_comic_info.cache_clear()
 
 if __name__ == '__main__':
     main()
