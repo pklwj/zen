@@ -10,7 +10,7 @@ https://github.com/srinivasr/nirimod
 ![高斯模糊](image.png)
 
 
-## 没有网络连接快捷方式
+## 没有网络连接快捷方式 
 ```shell
 cat <<EOF > ~/.local/share/applications/nm-connection-editor.desktop
 [Desktop Entry]
